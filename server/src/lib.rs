@@ -51,6 +51,7 @@ use access::http::{AuthState, apply_auth};
 use attic::cache::CacheName;
 use config::{Config, StorageConfig};
 use database::migration::{Migrator, MigratorTrait};
+use database::sqlite_maintenance;
 use error::{ErrorKind, ServerError, ServerResult};
 use middleware::{init_request_state, restrict_host, set_visibility_header};
 use storage::{LocalBackend, S3Backend, StorageBackendImpl};
@@ -109,9 +110,11 @@ impl StateInner {
     async fn database(&self) -> ServerResult<&DatabaseConnection> {
         self.database
             .get_or_try_init(|| async {
-                let db = Database::connect(&self.config.database.url)
-                    .await
-                    .map_err(ServerError::database_error);
+                let db = Database::connect(sqlite_maintenance::connect_options(
+                    &self.config.database.url,
+                ))
+                .await
+                .map_err(ServerError::database_error);
                 if let Ok(db_conn) = &db
                     && let DatabaseConnectionType::SqlxSqlitePoolConnection(conn) = &db_conn.inner
                 {
@@ -252,14 +255,18 @@ pub async fn run_api_server(
 
     let server = axum::serve(listener, rest);
 
-    let heartbeat_handle = if state.config.database.heartbeat {
-        let state_clone = state.clone();
-        Some(tokio::spawn(async move {
-            let _ = state_clone.run_db_heartbeat().await;
-        }))
-    } else {
-        None
-    };
+    // SQLite needs periodic acquisitions to maintain statistics even while idle.
+    let heartbeat_handle =
+        if state.config.database.heartbeat || state.config.database.url.starts_with("sqlite:") {
+            let state_clone = state.clone();
+            Some(tokio::spawn(async move {
+                if let Err(error) = state_clone.run_db_heartbeat().await {
+                    tracing::warn!(%error, "Database heartbeat stopped");
+                }
+            }))
+        } else {
+            None
+        };
 
     let server_result = server
         .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -282,6 +289,7 @@ pub async fn run_migrations(config: Config) -> Result<()> {
     let state = StateInner::new(config).await;
     let db = state.database().await?;
     Migrator::up(db, None).await?;
+    sqlite_maintenance::after_migrations(db).await;
 
     Ok(())
 }

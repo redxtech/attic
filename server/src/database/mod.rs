@@ -1,5 +1,6 @@
 pub mod entity;
 pub mod migration;
+pub(crate) mod sqlite_maintenance;
 
 use std::future::Future;
 use std::ops::Deref;
@@ -140,6 +141,31 @@ pub fn build_cache_object_nar_query(include_chunks: bool) -> Select<Object> {
     query
 }
 
+fn build_find_and_lock_chunk_query(
+    chunk_hash: &Hash,
+    compression: Compression,
+) -> sea_orm::sea_query::UpdateStatement {
+    let one = Value::Unsigned(Some(1));
+    let matched_ids = Query::select()
+        .from(Chunk)
+        .and_where(chunk::Column::ChunkHash.eq(chunk_hash.to_typed_base16()))
+        .and_where(chunk::Column::State.eq(ChunkState::Valid))
+        .and_where(chunk::Column::Compression.eq(compression.as_str()))
+        .expr(Expr::col(chunk::Column::Id))
+        .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+        .limit(1)
+        .to_owned();
+    Query::update()
+        .table(Chunk)
+        .values([(
+            chunk::Column::HoldersCount,
+            Expr::col(chunk::Column::HoldersCount).add(one),
+        )])
+        .and_where(chunk::Column::Id.in_subquery(matched_ids))
+        .returning_all()
+        .to_owned()
+}
+
 impl AtticDatabase for DatabaseConnection {
     async fn find_object_and_chunks_by_store_path_hash(
         &self,
@@ -278,26 +304,9 @@ impl AtticDatabase for DatabaseConnection {
         chunk_hash: &Hash,
         compression: Compression,
     ) -> ServerResult<Option<ChunkGuard>> {
-        let one = Value::Unsigned(Some(1));
-        let matched_ids = Query::select()
-            .from(Chunk)
-            .and_where(chunk::Column::ChunkHash.eq(chunk_hash.to_typed_base16()))
-            .and_where(chunk::Column::State.eq(ChunkState::Valid))
-            .and_where(chunk::Column::Compression.eq(compression.as_str()))
-            .expr(Expr::col(chunk::Column::Id))
-            .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
-            .limit(1)
-            .to_owned();
-        let incr_holders = Query::update()
-            .table(Chunk)
-            .values([(
-                chunk::Column::HoldersCount,
-                Expr::col(chunk::Column::HoldersCount).add(one),
-            )])
-            .and_where(chunk::Column::Id.in_subquery(matched_ids))
-            .returning_all()
-            .to_owned();
-        let stmt = self.get_database_backend().build(&incr_holders);
+        let stmt = self
+            .get_database_backend()
+            .build(&build_find_and_lock_chunk_query(chunk_hash, compression));
 
         let guard = chunk::Model::find_by_statement(stmt)
             .one(self)

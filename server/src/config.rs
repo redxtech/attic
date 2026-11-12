@@ -212,6 +212,8 @@ pub struct DatabaseConfig {
     /// Whether to enable sending of periodic heartbeat queries.
     ///
     /// If enabled, a heartbeat query will be sent every minute.
+    /// SQLite always sends these queries to drive periodic planner maintenance,
+    /// even when this option is disabled.
     #[serde(default = "default_db_heartbeat")]
     pub heartbeat: bool,
 }
